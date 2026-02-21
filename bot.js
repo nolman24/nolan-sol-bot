@@ -683,6 +683,24 @@ bot.command("reset", async ctx => {
 
 loadState();
 
+// Railway requires a service to bind to PORT — without this it sends SIGTERM
+// thinking the process failed. This tiny server satisfies that check.
+import http from "http";
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  const pf = portfolioSummary();
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    status:        "running",
+    paused:        state.config.paused,
+    scanned:       state.stats.tokensScanned,
+    alerts:        state.stats.alertsSent,
+    openTrades:    pf.openCount,
+    totalPnlSOL:   pf.total,
+    uptime:        Math.floor((Date.now() - state.stats.startedAt) / 1000) + "s",
+  }));
+}).listen(PORT, () => console.log(`✅ Health check server on port ${PORT}`));
+
 bot.launch();
 console.log("✅ Telegram bot online");
 
