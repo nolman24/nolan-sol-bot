@@ -1,28 +1,27 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // pump.fun Telegram Scanner Bot — Paper Trading Edition
-// Stack:   Node.js · Telegraf · @anthropic-ai/sdk
+// Stack:   Node.js · Telegraf · Groq API (free)
 // Deploy:  Railway — set env vars below, push to GitHub, done.
 //
 // ENV VARS REQUIRED:
 //   TELEGRAM_BOT_TOKEN  — from @BotFather
 //   TELEGRAM_CHAT_ID    — from @userinfobot
-//   ANTHROPIC_API_KEY   — from console.anthropic.com
+//   GROQ_API_KEY        — from console.groq.com (free)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Telegraf } from "telegraf";
-import Anthropic    from "@anthropic-ai/sdk";
 import fs           from "fs";
 
 // ─── VALIDATE ENV ────────────────────────────────────────────────────────────
 
-for (const key of ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "ANTHROPIC_API_KEY"]) {
+for (const key of ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY"]) {
   if (!process.env[key]) { console.error(`❌ Missing env var: ${key}`); process.exit(1); }
 }
 
-const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID       = process.env.TELEGRAM_CHAT_ID;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
-const STATE_FILE    = "./state.json";
+const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID    = process.env.TELEGRAM_CHAT_ID;
+const GROQ_KEY   = process.env.GROQ_API_KEY;
+const STATE_FILE = "./state.json";
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -84,8 +83,7 @@ function saveState() {
 
 // ─── CLIENTS ─────────────────────────────────────────────────────────────────
 
-const bot       = new Telegraf(BOT_TOKEN);
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+const bot = new Telegraf(BOT_TOKEN);
 
 // ─── RATE-LIMITED FETCH ──────────────────────────────────────────────────────
 // Automatic exponential backoff on 429 or network errors.
@@ -204,7 +202,7 @@ function scoreToken(coin) {
   };
 }
 
-// ─── CLAUDE ANALYSIS ─────────────────────────────────────────────────────────
+// ─── GROQ ANALYSIS ───────────────────────────────────────────────────────────
 
 async function analyzeToken(token) {
   const socials = [
@@ -213,12 +211,7 @@ async function analyzeToken(token) {
     token.hasWebsite  && "Website",
   ].filter(Boolean).join(", ") || "none";
 
-  const msg = await anthropic.messages.create({
-    model:      "claude-sonnet-4-20250514",
-    max_tokens: 350,
-    messages: [{
-      role: "user",
-      content: `You are a pump.fun trading expert. Tokens graduate at ~$34K mcap / ~42 SOL bonding curve.
+  const prompt = `You are a pump.fun trading expert. Tokens graduate at ~$34K mcap / ~42 SOL bonding curve.
 
 Token: $${token.symbol} | "${token.name}"
 ${token.description ? `Desc: "${token.description.slice(0, 150)}"` : ""}
@@ -232,11 +225,26 @@ King of the Hill: ${token.isKingOfHill ? "YES" : "no"}
 Write 3 short paragraphs for Telegram (plain text only, under 180 words total):
 1. Start with BUY / WATCH / SKIP in caps then one sentence why
 2. 2-3 bullet points (• character) on key signals
-3. One sentence on the main risk or what would make you exit`,
-    }],
+3. One sentence on the main risk or what would make you exit`;
+
+  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${GROQ_KEY}`,
+    },
+    body: JSON.stringify({
+      model:      "llama-3.3-70b-versatile",
+      max_tokens: 350,
+      temperature: 0.7,
+      messages: [{ role: "user", content: prompt }],
+    }),
+    signal: AbortSignal.timeout(15_000),
   });
 
-  return msg.content.map(b => b.type === "text" ? b.text : "").join("").trim();
+  if (!res.ok) throw new Error(`Groq API ${res.status}`);
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content?.trim() || "Analysis unavailable.";
 }
 
 // ─── PAPER TRADING ───────────────────────────────────────────────────────────
