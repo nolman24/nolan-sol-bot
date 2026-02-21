@@ -117,11 +117,29 @@ async function safeFetch(url, opts = {}) {
 }
 
 // ─── PUMP.FUN API ─────────────────────────────────────────────────────────────
+// Cloudflare blocks plain server requests — these headers make us look like
+// a real Chrome browser visiting pump.fun, which passes the CF check.
+
+const BROWSER_HEADERS = {
+  "Accept":                    "application/json, text/plain, */*",
+  "Accept-Language":           "en-US,en;q=0.9",
+  "Accept-Encoding":           "gzip, deflate, br",
+  "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+  "Referer":                   "https://pump.fun/",
+  "Origin":                    "https://pump.fun",
+  "sec-ch-ua":                 '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+  "sec-ch-ua-mobile":          "?0",
+  "sec-ch-ua-platform":        '"Windows"',
+  "sec-fetch-dest":            "empty",
+  "sec-fetch-mode":            "cors",
+  "sec-fetch-site":            "same-site",
+  "Connection":                "keep-alive",
+};
 
 async function fetchNewTokens() {
   const res = await safeFetch(
     "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC&includeNsfw=false",
-    { headers: { Accept: "application/json" } }
+    { headers: BROWSER_HEADERS }
   );
   if (!res.ok) throw new Error(`pump.fun API ${res.status}`);
   return res.json();
@@ -129,7 +147,10 @@ async function fetchNewTokens() {
 
 async function fetchTokenData(mint) {
   try {
-    const res = await safeFetch(`https://frontend-api.pump.fun/coins/${mint}`);
+    const res = await safeFetch(
+      `https://frontend-api.pump.fun/coins/${mint}`,
+      { headers: BROWSER_HEADERS }
+    );
     if (!res.ok) return null;
     return res.json();
   } catch { return null; }
