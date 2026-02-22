@@ -111,53 +111,95 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 let rpcId = 1;
 
-// Call Solana JSON-RPC over HTTP
 async function rpcCall(method, params = []) {
   const res = await fetch(RPC_HTTP, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
     body:    JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method, params }),
-    signal:  AbortSignal.timeout(10_000),
+    signal:  AbortSignal.timeout(12_000),
   });
   const data = await res.json();
   if (data.error) throw new Error(`RPC error: ${data.error.message}`);
   return data.result;
 }
 
-// Given a transaction signature, extract the mint address of the new token.
-// For pump.fun "create" transactions the mint is the first account key.
-async function getMintFromSignature(signature) {
-  try {
-    const tx = await rpcCall("getTransaction", [
-      signature,
-      { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 },
-    ]);
-    if (!tx) return null;
+// ─── THROTTLED SIGNATURE QUEUE ────────────────────────────────────────────────
+// The public Solana RPC rate-limits getTransaction to ~1 req/sec.
+// We queue signatures and process them one at a time with a 1.1s gap,
+// retrying on rate-limit errors. Items older than 90s are dropped (too late).
 
-    const keys = tx.transaction?.message?.accountKeys
-               ?? tx.transaction?.message?.staticAccountKeys;
-    if (!keys || !keys.length) return null;
+const SYSTEM_ACCOUNTS = new Set([
+  "11111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv",
+  "SysvarRent111111111111111111111111111111111",
+  "SysvarC1ock11111111111111111111111111111111",
+  PUMP_PROGRAM_ID,
+]);
 
-    // pump.fun create: account[0] = mint, account[1] = mint authority/fee payer
-    // We return the first account that looks like a mint (not a system account)
-    const SYSTEM_ACCOUNTS = new Set([
-      "11111111111111111111111111111111",        // System program
-      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token program
-      "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv",  // ATA program
-      "SysvarRent111111111111111111111111111111111",
-      "SysvarC1ock11111111111111111111111111111111",
-      PUMP_PROGRAM_ID,
-    ]);
+const sigQueue   = [];   // { sig, enqueuedAt }
+let   queueBusy  = false;
 
-    for (const key of keys) {
-      const k = typeof key === "string" ? key : key.pubkey || key.toString();
-      if (!SYSTEM_ACCOUNTS.has(k) && k.length >= 32) return k;
+function enqueueSig(sig) {
+  // Drop duplicates already in queue
+  if (sigQueue.some(item => item.sig === sig)) return;
+  sigQueue.push({ sig, enqueuedAt: Date.now() });
+  if (!queueBusy) processQueue();
+}
+
+async function processQueue() {
+  queueBusy = true;
+  while (sigQueue.length > 0) {
+    const item = sigQueue.shift();
+
+    // Drop if too old — token would be irrelevant by now
+    if (Date.now() - item.enqueuedAt > 90_000) {
+      console.log(`[queue] Dropped stale sig ${item.sig.slice(0, 12)}...`);
+      continue;
     }
-    return null;
-  } catch (e) {
-    console.error("[rpc] getTransaction failed:", e.message);
-    return null;
+
+    await getMintFromSignature(item.sig, 3)
+      .then(mint => { if (mint) handleMint(mint); })
+      .catch(() => {});
+
+    // Pause between calls to stay under the rate limit
+    if (sigQueue.length > 0) await sleep(1_100);
   }
+  queueBusy = false;
+}
+
+async function getMintFromSignature(signature, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const tx = await rpcCall("getTransaction", [
+        signature,
+        { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 },
+      ]);
+      if (!tx) return null;
+
+      const keys = tx.transaction?.message?.accountKeys
+                 ?? tx.transaction?.message?.staticAccountKeys;
+      if (!keys?.length) return null;
+
+      for (const key of keys) {
+        const k = typeof key === "string" ? key : key.pubkey || key.toString();
+        if (!SYSTEM_ACCOUNTS.has(k) && k.length >= 32) return k;
+      }
+      return null;
+
+    } catch (e) {
+      const isRateLimit = e.message.includes("Too many requests") || e.message.includes("429");
+      if (isRateLimit && attempt < retries) {
+        const wait = attempt * 2_000; // 2s, 4s, 6s
+        console.log(`[rpc] Rate limited — retry ${attempt}/${retries} in ${wait / 1000}s`);
+        await sleep(wait);
+      } else {
+        if (!isRateLimit) console.error("[rpc] getTransaction failed:", e.message);
+        return null;
+      }
+    }
+  }
+  return null;
 }
 
 // ─── PUMP.FUN METADATA ───────────────────────────────────────────────────────
@@ -533,10 +575,8 @@ function connectSolanaWS() {
 
     console.log(`[ws] New token creation detected — sig ${sig.slice(0, 16)}...`);
 
-    // Get mint from transaction, then handle it
-    getMintFromSignature(sig)
-      .then(mint => { if (mint) handleMint(mint); })
-      .catch(e => console.error("[ws] getMint failed:", e.message));
+    // Add to throttled queue — processes 1/sec with retries to avoid rate limits
+    enqueueSig(sig);
   });
 
   ws.on("close", (code, reason) => {
