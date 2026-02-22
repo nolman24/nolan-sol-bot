@@ -1,6 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // pump.fun Telegram Scanner Bot — Paper Trading Edition
-// Stack:   Node.js · Telegraf · socket.io-client · Groq API (free)
+// Stack:   Node.js · Telegraf · Solana RPC WebSocket · Groq API (free)
 // Deploy:  Railway — set env vars, push to GitHub, done.
 //
 // ENV VARS REQUIRED:
@@ -8,16 +8,21 @@
 //   TELEGRAM_CHAT_ID    — from @userinfobot
 //   GROQ_API_KEY        — from console.groq.com (free)
 //
-// WHY WEBSOCKET INSTEAD OF REST:
-//   pump.fun's REST API is behind Cloudflare which blocks datacenter IPs.
-//   Their WebSocket feed (used by the pump.fun website itself) is not blocked
-//   and delivers new token events in real time — no polling needed at all.
+// OPTIONAL (recommended for reliability):
+//   HELIUS_API_KEY      — free at helius.dev — better RPC, won't rate-limit you
+//
+// HOW IT WORKS:
+//   Instead of polling pump.fun's Cloudflare-protected HTTP API, we connect
+//   directly to a Solana RPC WebSocket and subscribe to logs from the pump.fun
+//   program (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P). Every time a new
+//   token is created on-chain we see it instantly. We then fetch metadata from
+//   pump.fun for that specific mint — one targeted request, not bulk polling.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { Telegraf }  from "telegraf";
-import { io }        from "socket.io-client";
-import http          from "http";
-import fs            from "fs";
+import { Telegraf } from "telegraf";
+import http         from "http";
+import fs           from "fs";
+import WebSocket    from "ws";
 
 // ─── VALIDATE ENV ────────────────────────────────────────────────────────────
 
@@ -25,29 +30,43 @@ for (const key of ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GROQ_API_KEY"]) {
   if (!process.env[key]) { console.error(`❌ Missing env var: ${key}`); process.exit(1); }
 }
 
-const BOT_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID    = process.env.TELEGRAM_CHAT_ID;
-const GROQ_KEY   = process.env.GROQ_API_KEY;
-const STATE_FILE = "./state.json";
+const BOT_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID     = process.env.TELEGRAM_CHAT_ID;
+const GROQ_KEY    = process.env.GROQ_API_KEY;
+const HELIUS_KEY  = process.env.HELIUS_API_KEY || null;
+const STATE_FILE  = "./state.json";
 
-// ─── CONFIG ──────────────────────────────────────────────────────────────────
+// ─── SOLANA CONFIG ───────────────────────────────────────────────────────────
 
-const GRADUATION_SOL    = 42;        // SOL to fill bonding curve → ~$34K mcap
-const SOL_PRICE_USD     = 175;       // Rough SOL/USD
-const PRICE_INTERVAL_MS = 30_000;    // Refresh open trade prices every 30s
-const MAX_OPEN_TRADES   = 20;        // Cap on simultaneous paper positions
-const PNL_ALERT_STEP    = 25;        // Alert every ±25% move on open trades
-const WS_RECONNECT_MS   = 5_000;     // Reconnect delay if WebSocket drops
+const PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+
+// Use Helius if key provided (more reliable), else public RPC
+const RPC_WS  = HELIUS_KEY
+  ? `wss://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
+  : "wss://api.mainnet-beta.solana.com";
+
+const RPC_HTTP = HELIUS_KEY
+  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`
+  : "https://api.mainnet-beta.solana.com";
+
+// ─── BOT CONFIG ──────────────────────────────────────────────────────────────
+
+const GRADUATION_SOL    = 42;
+const SOL_PRICE_USD     = 175;
+const PRICE_INTERVAL_MS = 30_000;
+const MAX_OPEN_TRADES   = 20;
+const PNL_ALERT_STEP    = 25;
+const RECONNECT_DELAY   = 5_000;
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 
 let state = {
   config: {
-    minScore:     65,
-    tradeAmount:  0.1,
-    paused:       false,
+    minScore:    65,
+    tradeAmount: 0.1,
+    paused:      false,
     paperTrading: true,
-    alertWatch:   false,
+    alertWatch:  false,
   },
   seenMints:    [],
   openTrades:   {},
@@ -83,23 +102,75 @@ function saveState() {
   catch (e) { console.error("[state] Save failed:", e.message); }
 }
 
-// ─── TELEGRAM CLIENT ─────────────────────────────────────────────────────────
+// ─── CLIENTS ─────────────────────────────────────────────────────────────────
 
 const bot = new Telegraf(BOT_TOKEN);
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── PRICE FETCH (for open trade updates only) ────────────────────────────────
-// We only use HTTP for refreshing prices on open trades — much lower request
-// volume than scanning, so Cloudflare rarely triggers on these.
+// ─── SOLANA RPC HELPERS ───────────────────────────────────────────────────────
 
-async function fetchTokenPrice(mint) {
+let rpcId = 1;
+
+// Call Solana JSON-RPC over HTTP
+async function rpcCall(method, params = []) {
+  const res = await fetch(RPC_HTTP, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method, params }),
+    signal:  AbortSignal.timeout(10_000),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(`RPC error: ${data.error.message}`);
+  return data.result;
+}
+
+// Given a transaction signature, extract the mint address of the new token.
+// For pump.fun "create" transactions the mint is the first account key.
+async function getMintFromSignature(signature) {
+  try {
+    const tx = await rpcCall("getTransaction", [
+      signature,
+      { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 },
+    ]);
+    if (!tx) return null;
+
+    const keys = tx.transaction?.message?.accountKeys
+               ?? tx.transaction?.message?.staticAccountKeys;
+    if (!keys || !keys.length) return null;
+
+    // pump.fun create: account[0] = mint, account[1] = mint authority/fee payer
+    // We return the first account that looks like a mint (not a system account)
+    const SYSTEM_ACCOUNTS = new Set([
+      "11111111111111111111111111111111",        // System program
+      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token program
+      "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe8bv",  // ATA program
+      "SysvarRent111111111111111111111111111111111",
+      "SysvarC1ock11111111111111111111111111111111",
+      PUMP_PROGRAM_ID,
+    ]);
+
+    for (const key of keys) {
+      const k = typeof key === "string" ? key : key.pubkey || key.toString();
+      if (!SYSTEM_ACCOUNTS.has(k) && k.length >= 32) return k;
+    }
+    return null;
+  } catch (e) {
+    console.error("[rpc] getTransaction failed:", e.message);
+    return null;
+  }
+}
+
+// ─── PUMP.FUN METADATA ───────────────────────────────────────────────────────
+// Single targeted fetch for one mint — much less likely to be blocked than bulk.
+
+async function fetchTokenMeta(mint) {
   try {
     const res = await fetch(`https://frontend-api.pump.fun/coins/${mint}`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept":     "application/json",
         "Referer":    "https://pump.fun/",
+        "Origin":     "https://pump.fun",
       },
       signal: AbortSignal.timeout(8_000),
     });
@@ -108,9 +179,7 @@ async function fetchTokenPrice(mint) {
   } catch { return null; }
 }
 
-// ─── SCORING ENGINE ──────────────────────────────────────────────────────────
-// The WebSocket `newCoinCreated` event sends the full coin object —
-// same fields as the REST API.
+// ─── SCORING ─────────────────────────────────────────────────────────────────
 
 function scoreToken(coin) {
   const solInCurve   = (coin.virtual_sol_reserves  || 0) / 1e9;
@@ -142,7 +211,7 @@ function scoreToken(coin) {
   score = Math.max(0, Math.min(100, Math.round(score)));
 
   return {
-    mint:         coin.mint,
+    mint:         coin.mint || coin,
     symbol:       (coin.symbol      || "???").toUpperCase(),
     name:         coin.name         || "Unknown",
     description:  coin.description  || "",
@@ -156,7 +225,7 @@ function scoreToken(coin) {
     isKingOfHill,
     complete:     !!coin.complete,
     score,
-    verdict:      score >= 68 ? "BUY" : score >= 45 ? "WATCH" : "SKIP",
+    verdict: score >= 68 ? "BUY" : score >= 45 ? "WATCH" : "SKIP",
   };
 }
 
@@ -201,7 +270,7 @@ Write 3 short paragraphs for Telegram (plain text only, under 180 words total):
     signal: AbortSignal.timeout(15_000),
   });
 
-  if (!res.ok) throw new Error(`Groq API ${res.status}`);
+  if (!res.ok) throw new Error(`Groq ${res.status}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content?.trim() || "Analysis unavailable.";
 }
@@ -211,7 +280,6 @@ Write 3 short paragraphs for Telegram (plain text only, under 180 words total):
 function openTrade(token) {
   if (Object.keys(state.openTrades).length >= MAX_OPEN_TRADES) return null;
   if (state.openTrades[token.mint]) return null;
-
   const trade = {
     mint:          token.mint,
     symbol:        token.symbol,
@@ -226,7 +294,6 @@ function openTrade(token) {
     lastAlertStep: 0,
     migrated:      false,
   };
-
   state.openTrades[token.mint] = trade;
   state.stats.totalTrades++;
   saveState();
@@ -236,7 +303,6 @@ function openTrade(token) {
 function closeTrade(mint, exitMcap, reason = "manual") {
   const trade = state.openTrades[mint];
   if (!trade) return null;
-
   const { pnlSOL, pnlUSD, pnlPct } = calcPnL(trade, exitMcap);
   const closed = {
     ...trade, exitMcap,
@@ -244,7 +310,6 @@ function closeTrade(mint, exitMcap, reason = "manual") {
     durationMs: Date.now() - trade.entryTime,
     pnlSOL, pnlUSD, pnlPct, reason,
   };
-
   state.closedTrades.unshift(closed);
   delete state.openTrades[mint];
   saveState();
@@ -283,25 +348,21 @@ function fmtUSD(n) {
   if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}K`;
   return `$${Math.round(n)}`;
 }
-
 function fmtAge(s) {
   if (s < 60)   return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
-
 function fmtDuration(ms) {
   const s = Math.floor(ms / 1000);
   if (s < 60)   return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
-
 function bondingBar(pct) {
-  const filled = Math.min(20, Math.round(pct / 5));
-  return `[${"█".repeat(filled)}${"░".repeat(20 - filled)}] ${pct}%`;
+  const f = Math.min(20, Math.round(pct / 5));
+  return `[${"█".repeat(f)}${"░".repeat(20 - f)}] ${pct}%`;
 }
-
 function pnlEmoji(pct) {
   if (pct >= 200) return "🚀🚀";
   if (pct >= 100) return "🚀";
@@ -321,10 +382,8 @@ async function sendTokenAlert(token, analysis) {
     token.hasTelegram && "💬 TG",
     token.hasWebsite  && "🌐 Web",
   ].filter(Boolean).join("  ") || "no socials";
-
-  const trade    = state.openTrades[token.mint];
-  const paperLine = trade
-    ? `📝 Paper bought ${trade.solAmount} SOL @ ${fmtUSD(token.mcapUSD)}` : null;
+  const trade     = state.openTrades[token.mint];
+  const paperLine = trade ? `📝 Paper bought ${trade.solAmount} SOL @ ${fmtUSD(token.mcapUSD)}` : null;
 
   const lines = [
     `${emoji} *${token.verdict}* — Score: ${token.score}/100`,
@@ -358,12 +417,9 @@ async function sendPnLAlert(trade, pnlPct, pnlSOL, currentMcap, isMigration = fa
   const header = isMigration
     ? `🎓 *GRADUATED* — $${trade.symbol} hit Raydium!`
     : `${pnlEmoji(pnlPct)} *P&L UPDATE* — $${trade.symbol}`;
-
   await bot.telegram.sendMessage(CHAT_ID, [
-    header,
-    `━━━━━━━━━━━━━━━━━━━━`,
+    header, `━━━━━━━━━━━━━━━━━━━━`,
     `${sign}${pnlPct}%  |  ${sign}${pnlSOL.toFixed(4)} SOL  |  ${pnlPct >= 0 ? "+" : "-"}$${usdAbs}`,
-    ``,
     `Entry: ${fmtUSD(trade.entryMcap)}  →  Now: ${fmtUSD(currentMcap)}`,
     `Peak: ${fmtUSD(trade.peakMcap)}  |  Held: ${fmtDuration(Date.now() - trade.entryTime)}`,
     `\`${trade.mint}\``,
@@ -382,91 +438,133 @@ async function sendCloseAlert(trade) {
 }
 
 // ─── TOKEN HANDLER ────────────────────────────────────────────────────────────
-// Called by the WebSocket listener each time a new coin event arrives.
 
-async function handleNewCoin(coin) {
-  if (!coin?.mint)                           return;
-  if (coin.complete)                         return; // already migrated
-  if (state.seenMints.includes(coin.mint))   return; // duplicate
+async function handleMint(mint) {
+  if (!mint)                                 return;
+  if (state.seenMints.includes(mint))        return;
 
-  state.seenMints.push(coin.mint);
+  state.seenMints.push(mint);
   state.stats.tokensReceived++;
   state.stats.lastEventAt = Date.now();
 
   if (state.config.paused) return;
 
-  const token = scoreToken(coin);
+  // Fetch full metadata from pump.fun (single targeted request)
+  const coin = await fetchTokenMeta(mint);
+
+  // Build token object — fall back to mint-only if fetch failed
+  const tokenData = coin || { mint, symbol: "???", name: "Unknown" };
+  if (coin?.complete) return; // already graduated
+
+  const token = scoreToken(tokenData);
 
   const shouldAlert =
     (token.verdict === "BUY"   && token.score >= state.config.minScore) ||
     (token.verdict === "WATCH" && state.config.alertWatch);
 
   if (!shouldAlert) {
-    console.log(`[ws] SKIP $${token.symbol} score=${token.score}`);
+    console.log(`[chain] SKIP $${token.symbol} score=${token.score}`);
+    saveState();
     return;
   }
 
-  console.log(`[ws] ${token.verdict} $${token.symbol} score=${token.score} sol=${token.solInCurve}`);
+  console.log(`[chain] ${token.verdict} $${token.symbol} score=${token.score}`);
 
-  if (state.config.paperTrading && token.verdict === "BUY") {
-    openTrade(token);
-  }
+  if (state.config.paperTrading && token.verdict === "BUY") openTrade(token);
 
   analyzeToken(token)
     .then(analysis => sendTokenAlert(token, analysis))
-    .catch(e => console.error("[alert] Failed:", e.message));
+    .catch(e => console.error("[alert]", e.message));
 
   saveState();
 }
 
-// ─── WEBSOCKET CONNECTION ─────────────────────────────────────────────────────
-// pump.fun uses Socket.IO. The `newCoinCreated` event fires for every new token.
-// The connection auto-reconnects if it drops.
+// ─── SOLANA WEBSOCKET ────────────────────────────────────────────────────────
+// Subscribe to logs for pump.fun program ID.
+// Every time the program is invoked with "Instruction: Create" we have a new token.
 
-function connectWebSocket() {
-  console.log("[ws] Connecting to pump.fun WebSocket...");
+let wsReconnectTimer = null;
 
-  const socket = io("https://frontend-api.pump.fun", {
-    transports:         ["websocket"],
-    reconnection:       true,
-    reconnectionDelay:  WS_RECONNECT_MS,
-    reconnectionDelayMax: 30_000,
-    extraHeaders: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "Origin":     "https://pump.fun",
-      "Referer":    "https://pump.fun/",
-    },
-  });
+function connectSolanaWS() {
+  console.log(`[ws] Connecting to Solana RPC${HELIUS_KEY ? " (Helius)" : " (public)"}...`);
 
-  socket.on("connect", () => {
-    console.log("[ws] ✅ Connected to pump.fun");
+  const ws = new WebSocket(RPC_WS);
+
+  ws.on("open", () => {
+    console.log("[ws] ✅ Connected — subscribing to pump.fun program logs");
     state.stats.wsConnected = true;
+
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id:      1,
+      method:  "logsSubscribe",
+      params: [
+        { mentions: [PUMP_PROGRAM_ID] },
+        { commitment: "confirmed" },
+      ],
+    }));
+
     bot.telegram.sendMessage(CHAT_ID,
-      `🟢 *WebSocket connected* — receiving live token feed`,
+      `🟢 *Solana WS connected*\nWatching pump.fun program on-chain — real-time token detection`,
       { parse_mode: "Markdown" }
     ).catch(() => {});
   });
 
-  // This is the key event — fires the instant a new token is created
-  socket.on("newCoinCreated", (coin) => {
-    handleNewCoin(coin).catch(e => console.error("[handler] Error:", e.message));
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    // Subscription confirmation
+    if (msg.id === 1 && msg.result !== undefined) {
+      console.log(`[ws] Subscribed — sub ID ${msg.result}`);
+      return;
+    }
+
+    const value = msg?.params?.result?.value;
+    if (!value) return;
+
+    const logs = value.logs || [];
+    const sig  = value.signature;
+
+    // Only care about successful "Create" instructions — new token creation
+    if (value.err !== null)                       return;
+    if (!logs.some(l => l.includes("Instruction: Create"))) return;
+    if (!sig)                                     return;
+
+    console.log(`[ws] New token creation detected — sig ${sig.slice(0, 16)}...`);
+
+    // Get mint from transaction, then handle it
+    getMintFromSignature(sig)
+      .then(mint => { if (mint) handleMint(mint); })
+      .catch(e => console.error("[ws] getMint failed:", e.message));
   });
 
-  socket.on("disconnect", (reason) => {
-    console.warn("[ws] Disconnected:", reason);
+  ws.on("close", (code, reason) => {
     state.stats.wsConnected = false;
+    console.warn(`[ws] Disconnected — code ${code}. Reconnecting in ${RECONNECT_DELAY / 1000}s...`);
     bot.telegram.sendMessage(CHAT_ID,
-      `🟡 *WebSocket disconnected* (${reason}) — reconnecting...`,
+      `🟡 *Solana WS disconnected* — reconnecting in ${RECONNECT_DELAY / 1000}s`,
       { parse_mode: "Markdown" }
     ).catch(() => {});
+    wsReconnectTimer = setTimeout(connectSolanaWS, RECONNECT_DELAY);
   });
 
-  socket.on("connect_error", (err) => {
-    console.error("[ws] Connection error:", err.message);
+  ws.on("error", (err) => {
+    console.error("[ws] Error:", err.message);
     state.stats.wsConnected = false;
+    // close handler will trigger reconnect
   });
 
-  return socket;
+  // Keep-alive ping every 20s so the connection doesn't time out
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: 999, method: "getHealth" }));
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 20_000);
+
+  return ws;
 }
 
 // ─── PRICE UPDATE LOOP ───────────────────────────────────────────────────────
@@ -479,7 +577,7 @@ async function updatePrices() {
     const trade = state.openTrades[mint];
     if (!trade) continue;
 
-    const data = await fetchTokenPrice(mint);
+    const data = await fetchTokenMeta(mint);
     if (!data) continue;
 
     const currentMcap = data.usd_market_cap || trade.currentMcap;
@@ -503,7 +601,6 @@ async function updatePrices() {
       if (closed) await sendCloseAlert(closed).catch(() => {});
     }
   }
-
   saveState();
 }
 
@@ -512,7 +609,7 @@ async function updatePrices() {
 bot.command("start", ctx => ctx.reply([
   "🟠 *pump.fun Scanner Bot*",
   "━━━━━━━━━━━━━━━━━━━━",
-  "Listening for new tokens via WebSocket — zero polling, real-time.",
+  "Watching the Solana blockchain directly for new tokens.",
   "",
   "*Commands:*",
   "/status        — health, stats & portfolio summary",
@@ -527,21 +624,19 @@ bot.command("start", ctx => ctx.reply([
 ].join("\n"), { parse_mode: "Markdown" }));
 
 bot.command("status", async ctx => {
-  const pf     = portfolioSummary();
-  const uptime = fmtDuration(Date.now() - state.stats.startedAt);
+  const pf      = portfolioSummary();
+  const uptime  = fmtDuration(Date.now() - state.stats.startedAt);
   const lastEvt = state.stats.lastEventAt
-    ? `${Math.round((Date.now() - state.stats.lastEventAt) / 1000)}s ago`
-    : "none yet";
-
+    ? `${Math.round((Date.now() - state.stats.lastEventAt) / 1000)}s ago` : "none yet";
   await ctx.reply([
     `${state.config.paused ? "⏸ Paused" : "🟢 Running"} — pump.fun Scanner`,
     `━━━━━━━━━━━━━━━━━━━━`,
-    `🔌 WebSocket: ${state.stats.wsConnected ? "✅ Connected" : "🔴 Disconnected"}`,
+    `🔌 Solana WS: ${state.stats.wsConnected ? "✅ Connected" : "🔴 Disconnected"}`,
+    `📡 RPC: ${HELIUS_KEY ? "Helius (enhanced)" : "Public mainnet"}`,
     `⏱ Uptime: ${uptime}  |  Last token: ${lastEvt}`,
-    `🔍 Tokens received: ${state.stats.tokensReceived}`,
+    `🔍 Tokens detected: ${state.stats.tokensReceived}`,
     `📣 Alerts sent: ${state.stats.alertsSent}`,
-    `📊 Min score: ${state.config.minScore}  |  Trade size: ${state.config.tradeAmount} SOL`,
-    `👀 Watch alerts: ${state.config.alertWatch ? "ON" : "OFF"}`,
+    `📊 Min score: ${state.config.minScore}  |  Trade: ${state.config.tradeAmount} SOL`,
     ``,
     `💼 *Portfolio:*`,
     `  Open: ${pf.openCount}  |  Closed: ${pf.closedCount}`,
@@ -555,7 +650,6 @@ bot.command("status", async ctx => {
 bot.command("portfolio", async ctx => {
   const open = Object.values(state.openTrades);
   if (!open.length) { await ctx.reply("No open paper trades."); return; }
-
   const lines = ["📂 *Open Trades*", "━━━━━━━━━━━━━━━━━━━━"];
   for (const trade of open) {
     const { pnlPct, pnlSOL } = calcPnL(trade, trade.currentMcap);
@@ -567,19 +661,15 @@ bot.command("portfolio", async ctx => {
     );
   }
   const pf = portfolioSummary();
-  lines.push(
-    "━━━━━━━━━━━━━━━━━━━━",
+  lines.push("━━━━━━━━━━━━━━━━━━━━",
     `Unrealized: ${pf.unrealized >= 0 ? "+" : ""}${pf.unrealized} SOL`,
-    `Realized:   ${pf.realized  >= 0 ? "+" : ""}${pf.realized} SOL`,
-    `*Total P&L: ${pf.total >= 0 ? "+" : ""}${pf.total} SOL*`,
-  );
+    `*Total P&L: ${pf.total >= 0 ? "+" : ""}${pf.total} SOL*`);
   await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 });
 
 bot.command("trades", async ctx => {
   const recent = state.closedTrades.slice(0, 10);
   if (!recent.length) { await ctx.reply("No closed trades yet."); return; }
-
   const lines = ["📋 *Last 10 Closed Trades*", "━━━━━━━━━━━━━━━━━━━━"];
   for (const t of recent) {
     const sign = t.pnlPct >= 0 ? "+" : "";
@@ -594,7 +684,7 @@ bot.command("close", async ctx => {
   const mint = ctx.message.text.split(" ")[1]?.trim();
   if (!mint) { await ctx.reply("Usage: /close <contract_address>"); return; }
   if (!state.openTrades[mint]) { await ctx.reply("Trade not found."); return; }
-  const data     = await fetchTokenPrice(mint);
+  const data     = await fetchTokenMeta(mint);
   const exitMcap = data?.usd_market_cap || state.openTrades[mint].currentMcap;
   const closed   = closeTrade(mint, exitMcap, "manual");
   await sendCloseAlert(closed);
@@ -624,22 +714,21 @@ bot.command("watchalerts", async ctx => {
   await ctx.reply(`✅ WATCH alerts ${state.config.alertWatch ? "enabled" : "disabled"}`);
 });
 
-bot.command("pause",  async ctx => { state.config.paused = true;  saveState(); await ctx.reply("⏸ Scanner paused."); });
-bot.command("resume", async ctx => { state.config.paused = false; saveState(); await ctx.reply("▶️ Scanner resumed."); });
+bot.command("pause",  async ctx => { state.config.paused = true;  saveState(); await ctx.reply("⏸ Paused."); });
+bot.command("resume", async ctx => { state.config.paused = false; saveState(); await ctx.reply("▶️ Resumed."); });
 
 bot.command("reset", async ctx => {
   state.openTrades = {};
   state.closedTrades = [];
   state.stats = { tokensReceived: 0, alertsSent: 0, totalTrades: 0, startedAt: Date.now(), wsConnected: false, lastEventAt: null };
   saveState();
-  await ctx.reply("🔄 All trades and stats cleared.");
+  await ctx.reply("🔄 Cleared.");
 });
 
 // ─── BOOT ─────────────────────────────────────────────────────────────────────
 
 loadState();
 
-// Health check server — required by Railway to keep the process alive
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   const pf = portfolioSummary();
@@ -647,27 +736,23 @@ http.createServer((req, res) => {
   res.end(JSON.stringify({
     status:      "running",
     wsConnected: state.stats.wsConnected,
-    paused:      state.config.paused,
     received:    state.stats.tokensReceived,
     alerts:      state.stats.alertsSent,
     openTrades:  pf.openCount,
     totalPnlSOL: pf.total,
     uptime:      Math.floor((Date.now() - state.stats.startedAt) / 1000) + "s",
   }));
-}).listen(PORT, () => console.log(`✅ Health check server on port ${PORT}`));
+}).listen(PORT, () => console.log(`✅ Health check on port ${PORT}`));
 
 bot.launch();
 console.log("✅ Telegram bot online");
 
 bot.telegram.sendMessage(CHAT_ID,
-  `🟠 *pump.fun Scanner starting...*\nConnecting via WebSocket · Min score: ${state.config.minScore} · Paper trading: ON`,
+  `🟠 *pump.fun Scanner starting...*\nConnecting to Solana blockchain · Min score: ${state.config.minScore}`,
   { parse_mode: "Markdown" }
 ).catch(() => {});
 
-// Connect WebSocket — this replaces the polling loop entirely
-connectWebSocket();
-
-// Price refresh for open trades only
+connectSolanaWS();
 setInterval(updatePrices, PRICE_INTERVAL_MS);
 
 process.once("SIGINT",  () => { saveState(); bot.stop("SIGINT");  });
